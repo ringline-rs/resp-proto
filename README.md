@@ -15,10 +15,10 @@ A standalone, zero-copy protocol implementation with no runtime dependencies.
 
 ```toml
 [dependencies]
-resp-proto = "0.1"
+resp-proto = "0.0.1"
 
 # With RESP3 support:
-resp-proto = { version = "0.1", features = ["resp3"] }
+resp-proto = { version = "0.0.1", features = ["resp3"] }
 ```
 
 ## License
