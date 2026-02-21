@@ -1,0 +1,21 @@
+[package]
+name = "resp-proto"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ringline-rs/resp-proto"
+description = "RESP2/RESP3 protocol parser and encoder"
+readme = "README.md"
+keywords = ["redis", "resp", "protocol", "parser"]
+categories = ["network-programming", "parsing"]
+
+[features]
+default = []
+resp3 = ["dep:ryu"]
+
+[dependencies]
+bytes = "1"
+memchr = "2"
+itoa = "1"
+ryu = { version = "1", optional = true }
+thiserror = "2"

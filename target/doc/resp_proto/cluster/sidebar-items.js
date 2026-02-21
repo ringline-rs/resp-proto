@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["SLOT_COUNT"],"enum":["RedirectKind"],"fn":["crc16","hash_slot","parse_redirect"],"struct":["NodeInfo","Redirect","SlotMap","SlotRange"]};
