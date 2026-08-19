@@ -239,7 +239,7 @@ impl<'a> Command<'a> {
         buffer: &'a [u8],
         options: &ParseOptions,
     ) -> Result<(Self, usize), ParseError> {
-        let mut cursor = Cursor::new(buffer, options.max_bulk_string_len);
+        let mut cursor = Cursor::new(buffer, options.max_bulk_string_len, options.max_line_len);
 
         // Read array header
         if cursor.remaining() < 1 {
@@ -1110,14 +1110,16 @@ struct Cursor<'a> {
     buffer: &'a [u8],
     pos: usize,
     max_bulk_string_len: usize,
+    max_line_len: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(buffer: &'a [u8], max_bulk_string_len: usize) -> Self {
+    fn new(buffer: &'a [u8], max_bulk_string_len: usize, max_line_len: usize) -> Self {
         Self {
             buffer,
             pos: 0,
             max_bulk_string_len,
+            max_line_len,
         }
     }
 
@@ -1218,6 +1220,11 @@ impl<'a> Cursor<'a> {
             return Ok(line);
         }
 
+        // No CRLF yet. Bound how long a caller can be asked to keep buffering.
+        if slice.len() > self.max_line_len {
+            return Err(ParseError::Protocol("line too long".to_string()));
+        }
+
         Err(ParseError::Incomplete)
     }
 }
@@ -1225,6 +1232,23 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::DEFAULT_MAX_LINE_LEN;
+
+    #[test]
+    fn unterminated_command_line_is_bounded() {
+        // Without a bound the server-side parser reported Incomplete forever
+        // for a line that never terminates.
+        // +2 rather than +1: parse consumes the leading '*' before read_line,
+        // so +1 would leave exactly the bound rather than exceeding it.
+        let flood = vec![b'*'; DEFAULT_MAX_LINE_LEN + 2];
+        assert!(matches!(
+            Command::parse(&flood),
+            Err(ParseError::Protocol(ref m)) if m == "line too long"
+        ));
+
+        let ok = vec![b'*'; DEFAULT_MAX_LINE_LEN];
+        assert!(matches!(Command::parse(&ok), Err(ParseError::Incomplete)));
+    }
 
     #[test]
     fn bare_cr_in_protocol_line_errors_instead_of_stalling() {
