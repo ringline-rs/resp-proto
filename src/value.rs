@@ -791,16 +791,15 @@ impl Value {
 // Parsing helpers
 // ============================================================================
 
-/// Find the position of \r\n in the data.
+/// Find the position of the first `\r\n` in the data.
+///
+/// A bare `\r` not followed by `\n` is ordinary content, so the scan continues
+/// past it; only a real CRLF terminates a line. RESP simple strings and errors
+/// carry server text that can echo binary-safe key names, so a stray `\r` is
+/// reachable in practice.
 #[inline]
 fn find_crlf(data: &[u8]) -> Option<usize> {
-    memchr::memchr(b'\r', data).and_then(|pos| {
-        if pos + 1 < data.len() && data[pos + 1] == b'\n' {
-            Some(pos)
-        } else {
-            None
-        }
-    })
+    memchr::memmem::find(data, b"\r\n")
 }
 
 /// Parse a simple string: +OK\r\n
@@ -1985,6 +1984,32 @@ impl Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_crlf_skips_bare_cr() {
+        // A bare \r is content, not a terminator: keep scanning.
+        assert_eq!(find_crlf(b"a\rb\r\n"), Some(3));
+        assert_eq!(find_crlf(b"\r\n"), Some(0));
+        assert_eq!(find_crlf(b"\r\r\n"), Some(1));
+        assert_eq!(find_crlf(b"a\rb"), None);
+        assert_eq!(find_crlf(b""), None);
+    }
+
+    #[test]
+    fn bare_cr_in_simple_string_or_error_does_not_stall() {
+        // Redis keys are binary-safe and error replies echo user arguments, so
+        // a stray \r in server text is reachable. The line is complete; the
+        // parser must not report Incomplete and ask for bytes that cannot help.
+        let data = b"-ERR no such key 'a\rb'\r\n";
+        let (value, consumed) = Value::parse(data).expect("complete line must parse");
+        assert_eq!(consumed, data.len());
+        assert!(matches!(value, Value::Error(ref e) if e.as_ref() == b"ERR no such key 'a\rb'"));
+
+        let data = b"+OK a\rb\r\n";
+        let (value, consumed) = Value::parse(data).expect("complete line must parse");
+        assert_eq!(consumed, data.len());
+        assert!(matches!(value, Value::SimpleString(ref v) if v.as_ref() == b"OK a\rb"));
+    }
 
     #[test]
     fn test_parse_simple_string() {

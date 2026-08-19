@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- RESP line framing no longer stalls on a bare `\r`. Both scanners -- `find_crlf`
+  in the value parser and `Cursor::read_line` in the command parser -- inspected
+  only the first `\r` in the buffer and gave up if it was not followed by `\n`.
+  A complete, CRLF-terminated line containing a stray `\r` therefore reported
+  `Incomplete` forever, and since neither path is bounded, more data could never
+  help: the scan restarted at the same leading `\r` every time. Reachable in
+  practice because Redis keys are binary-safe and error replies echo
+  user-supplied arguments. Both now scan for a real CRLF.
+
 ## [0.0.1] - 2026-02-21
 
 ### Added
