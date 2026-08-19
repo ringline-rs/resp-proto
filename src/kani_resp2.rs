@@ -1,37 +1,40 @@
-//! Bounded proofs for the pure RESP2 framing seam.
+//! Bounded proof for the pure RESP2 line-framing decision seam.
 //!
-//! `find_crlf` controls every line/header boundary in the RESP2 value parser.
-//! The proof covers all `sum(256^n, n = 0..8)` byte strings, with unwind ten
-//! covering both scans over the maximum eight-byte input. Full parser behavior
-//! and slice/zero-copy agreement are bridged by `tests/resp2_random.rs`.
+//! `classify_first_cr` is called by the production `memchr` path and decides
+//! whether the first carriage return completes a line. The proof covers every
+//! eight-byte input and every optional candidate index. It does not prove the
+//! full parser or `memchr` itself; runtime tests bridge the classifier contract
+//! to both public parser entry points.
 
-use crate::value::find_crlf;
+use crate::value::classify_first_cr;
 
 const RAW_BYTES: usize = 8;
 
 #[kani::proof]
-#[kani::unwind(10)]
-fn crlf_classifier_returns_the_first_complete_delimiter() {
+fn first_cr_classifier_accepts_only_an_in_bounds_crlf() {
     let input: [u8; RAW_BYTES] = kani::any();
     let len: usize = kani::any();
     kani::assume(len <= RAW_BYTES);
-    let snapshot = input;
     let data = &input[..len];
+    let first_cr: Option<usize> = kani::any();
+    if let Some(position) = first_cr {
+        kani::assume(position < len);
+        kani::assume(data[position] == b'\r');
+    }
 
-    match find_crlf(data) {
+    let classified = classify_first_cr(data, first_cr);
+    match classified {
         Some(position) => {
+            assert_eq!(Some(position), first_cr);
             assert!(position + 1 < len);
             assert_eq!(data[position], b'\r');
             assert_eq!(data[position + 1], b'\n');
-            for prior in 0..position {
-                assert!(data[prior] != b'\r' || data[prior + 1] != b'\n');
-            }
         }
-        None => {
-            for position in 0..len.saturating_sub(1) {
-                assert!(data[position] != b'\r' || data[position + 1] != b'\n');
+        None => match first_cr {
+            None => {}
+            Some(position) => {
+                assert!(position + 1 >= len || data[position + 1] != b'\n');
             }
-        }
+        },
     }
-    assert_eq!(input, snapshot);
 }

@@ -794,14 +794,16 @@ impl Value {
 /// Find the position of \r\n in the data.
 #[inline]
 pub(crate) fn find_crlf(data: &[u8]) -> Option<usize> {
-    #[cfg(not(kani))]
-    {
-        memchr::memchr(b'\r', data).filter(|&pos| pos + 1 < data.len() && data[pos + 1] == b'\n')
-    }
-    #[cfg(kani)]
-    {
-        (0..data.len().saturating_sub(1)).find(|&pos| data[pos] == b'\r' && data[pos + 1] == b'\n')
-    }
+    classify_first_cr(data, memchr::memchr(b'\r', data))
+}
+
+/// Accept the first carriage return only when it begins a complete CRLF.
+///
+/// RESP line payloads cannot contain carriage returns or line feeds, so a
+/// carriage return not immediately followed by a line feed leaves the frame
+/// incomplete rather than scanning past malformed payload data.
+pub(crate) fn classify_first_cr(data: &[u8], first_cr: Option<usize>) -> Option<usize> {
+    first_cr.filter(|&pos| pos + 1 < data.len() && data[pos + 1] == b'\n')
 }
 
 /// Parse a simple string: +OK\r\n
