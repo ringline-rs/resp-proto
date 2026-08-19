@@ -1209,10 +1209,9 @@ impl<'a> Cursor<'a> {
         let start = self.pos;
         let slice = &self.buffer[start..];
 
-        if let Some(pos) = memchr::memchr(b'\r', slice)
-            && pos + 1 < slice.len()
-            && slice[pos + 1] == b'\n'
-        {
+        // A bare `\r` is ordinary content; scan for a real CRLF rather than
+        // inspecting only the first `\r`.
+        if let Some(pos) = memchr::memmem::find(slice, b"\r\n") {
             let end = start + pos;
             let line = &self.buffer[start..end];
             self.pos = end + 2;
@@ -1226,6 +1225,18 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_cr_in_protocol_line_errors_instead_of_stalling() {
+        // A malformed header line containing a bare \r used to make read_line
+        // report Incomplete forever, hanging the connection instead of
+        // rejecting the command.
+        let data = b"*1\r2\r\n$4\r\nPING\r\n";
+        assert!(matches!(
+            Command::parse(data),
+            Err(ParseError::InvalidInteger(_))
+        ));
+    }
 
     #[test]
     fn test_parse_ping() {
