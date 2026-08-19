@@ -52,6 +52,8 @@
 pub mod cluster;
 mod command;
 mod error;
+#[cfg(kani)]
+mod kani_resp2;
 mod request;
 pub mod streaming;
 mod value;

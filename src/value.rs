@@ -793,14 +793,15 @@ impl Value {
 
 /// Find the position of \r\n in the data.
 #[inline]
-fn find_crlf(data: &[u8]) -> Option<usize> {
-    memchr::memchr(b'\r', data).and_then(|pos| {
-        if pos + 1 < data.len() && data[pos + 1] == b'\n' {
-            Some(pos)
-        } else {
-            None
-        }
-    })
+pub(crate) fn find_crlf(data: &[u8]) -> Option<usize> {
+    #[cfg(not(kani))]
+    {
+        memchr::memchr(b'\r', data).filter(|&pos| pos + 1 < data.len() && data[pos + 1] == b'\n')
+    }
+    #[cfg(kani)]
+    {
+        (0..data.len().saturating_sub(1)).find(|&pos| data[pos] == b'\r' && data[pos + 1] == b'\n')
+    }
 }
 
 /// Parse a simple string: +OK\r\n
