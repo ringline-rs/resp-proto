@@ -239,7 +239,7 @@ impl<'a> Command<'a> {
         buffer: &'a [u8],
         options: &ParseOptions,
     ) -> Result<(Self, usize), ParseError> {
-        let mut cursor = Cursor::new(buffer, options.max_bulk_string_len);
+        let mut cursor = Cursor::new(buffer, options.max_bulk_string_len, options.max_line_len);
 
         // Read array header
         if cursor.remaining() < 1 {
@@ -1110,14 +1110,16 @@ struct Cursor<'a> {
     buffer: &'a [u8],
     pos: usize,
     max_bulk_string_len: usize,
+    max_line_len: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(buffer: &'a [u8], max_bulk_string_len: usize) -> Self {
+    fn new(buffer: &'a [u8], max_bulk_string_len: usize, max_line_len: usize) -> Self {
         Self {
             buffer,
             pos: 0,
             max_bulk_string_len,
+            max_line_len,
         }
     }
 
@@ -1209,14 +1211,18 @@ impl<'a> Cursor<'a> {
         let start = self.pos;
         let slice = &self.buffer[start..];
 
-        if let Some(pos) = memchr::memchr(b'\r', slice)
-            && pos + 1 < slice.len()
-            && slice[pos + 1] == b'\n'
-        {
+        // A bare `\r` is ordinary content; scan for a real CRLF rather than
+        // inspecting only the first `\r`.
+        if let Some(pos) = memchr::memmem::find(slice, b"\r\n") {
             let end = start + pos;
             let line = &self.buffer[start..end];
             self.pos = end + 2;
             return Ok(line);
+        }
+
+        // No CRLF yet. Bound how long a caller can be asked to keep buffering.
+        if slice.len() > self.max_line_len {
+            return Err(ParseError::Protocol("line too long".to_string()));
         }
 
         Err(ParseError::Incomplete)
@@ -1226,6 +1232,35 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::DEFAULT_MAX_LINE_LEN;
+
+    #[test]
+    fn unterminated_command_line_is_bounded() {
+        // Without a bound the server-side parser reported Incomplete forever
+        // for a line that never terminates.
+        // +2 rather than +1: parse consumes the leading '*' before read_line,
+        // so +1 would leave exactly the bound rather than exceeding it.
+        let flood = vec![b'*'; DEFAULT_MAX_LINE_LEN + 2];
+        assert!(matches!(
+            Command::parse(&flood),
+            Err(ParseError::Protocol(ref m)) if m == "line too long"
+        ));
+
+        let ok = vec![b'*'; DEFAULT_MAX_LINE_LEN];
+        assert!(matches!(Command::parse(&ok), Err(ParseError::Incomplete)));
+    }
+
+    #[test]
+    fn bare_cr_in_protocol_line_errors_instead_of_stalling() {
+        // A malformed header line containing a bare \r used to make read_line
+        // report Incomplete forever, hanging the connection instead of
+        // rejecting the command.
+        let data = b"*1\r2\r\n$4\r\nPING\r\n";
+        assert!(matches!(
+            Command::parse(data),
+            Err(ParseError::InvalidInteger(_))
+        ));
+    }
 
     #[test]
     fn test_parse_ping() {

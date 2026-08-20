@@ -119,8 +119,7 @@ pub fn parse_redirect(value: &Value) -> Option<Redirect> {
     let (kind, rest) = if let Some(rest) = s.strip_prefix("MOVED ") {
         (RedirectKind::Moved, rest)
     } else {
-        let rest = s.strip_prefix("ASK ")?;
-        (RedirectKind::Ask, rest)
+        (RedirectKind::Ask, s.strip_prefix("ASK ")?)
     };
 
     let mut parts = rest.splitn(2, ' ');

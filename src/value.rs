@@ -65,6 +65,14 @@ pub const DEFAULT_MAX_DEPTH: usize = 8;
 /// of nesting in a single parse operation to prevent such attacks.
 pub const DEFAULT_MAX_TOTAL_ITEMS: usize = 1024;
 
+/// Default maximum length of a single RESP protocol line, in bytes.
+///
+/// Applies to simple strings, errors, integers, doubles, big numbers, and the
+/// length headers of aggregate types -- not to bulk payload, which is bounded
+/// by [`DEFAULT_MAX_BULK_STRING_LEN`]. Matches Redis's own
+/// `PROTO_INLINE_MAX_SIZE`.
+pub const DEFAULT_MAX_LINE_LEN: usize = 64 * 1024;
+
 /// Configuration options for RESP value parsing.
 ///
 /// These options allow customizing the DoS protection limits for different
@@ -80,6 +88,12 @@ pub struct ParseOptions {
     pub max_bulk_string_len: usize,
     /// Maximum nesting depth for recursive structures.
     pub max_depth: usize,
+    /// Maximum length of a single protocol line in bytes.
+    ///
+    /// Without this, an unterminated line makes the parser report `Incomplete`
+    /// no matter how large the buffer grows, so a peer that never sends a
+    /// newline can make a caller buffer without limit.
+    pub max_line_len: usize,
     /// Maximum total items across all collections in a single parse.
     ///
     /// This is the critical limit for preventing exponential allocation attacks
@@ -96,6 +110,7 @@ impl Default for ParseOptions {
             max_bulk_string_len: DEFAULT_MAX_BULK_STRING_LEN,
             max_depth: DEFAULT_MAX_DEPTH,
             max_total_items: DEFAULT_MAX_TOTAL_ITEMS,
+            max_line_len: DEFAULT_MAX_LINE_LEN,
         }
     }
 }
@@ -109,6 +124,7 @@ impl ParseOptions {
             max_bulk_string_len: DEFAULT_MAX_BULK_STRING_LEN,
             max_depth: DEFAULT_MAX_DEPTH,
             max_total_items: DEFAULT_MAX_TOTAL_ITEMS,
+            max_line_len: DEFAULT_MAX_LINE_LEN,
         }
     }
 
@@ -139,6 +155,12 @@ impl ParseOptions {
     /// Set the maximum total items across all collections.
     pub const fn max_total_items(mut self, count: usize) -> Self {
         self.max_total_items = count;
+        self
+    }
+
+    /// Set the maximum length of a single protocol line.
+    pub const fn max_line_len(mut self, len: usize) -> Self {
+        self.max_line_len = len;
         self
     }
 }
@@ -588,9 +610,9 @@ impl Value {
         }
 
         match data[0] {
-            b'+' => parse_simple_string_bytes(data),
-            b'-' => parse_error_bytes(data),
-            b':' => parse_integer(&data[..]),
+            b'+' => parse_simple_string_bytes(data, options),
+            b'-' => parse_error_bytes(data, options),
+            b':' => parse_integer(&data[..], options),
             b'$' => parse_bulk_string_bytes(data, options),
             b'*' => parse_array_bytes(data, options, depth, total_items),
             #[cfg(feature = "resp3")]
@@ -598,9 +620,9 @@ impl Value {
             #[cfg(feature = "resp3")]
             b'#' => parse_boolean(&data[..]),
             #[cfg(feature = "resp3")]
-            b',' => parse_double(&data[..]),
+            b',' => parse_double(&data[..], options),
             #[cfg(feature = "resp3")]
-            b'(' => parse_big_number_bytes(data),
+            b'(' => parse_big_number_bytes(data, options),
             #[cfg(feature = "resp3")]
             b'!' => parse_bulk_error_bytes(data, options),
             #[cfg(feature = "resp3")]
@@ -630,9 +652,9 @@ impl Value {
 
         match data[0] {
             // RESP2 types
-            b'+' => parse_simple_string(data),
-            b'-' => parse_error(data),
-            b':' => parse_integer(data),
+            b'+' => parse_simple_string(data, options),
+            b'-' => parse_error(data, options),
+            b':' => parse_integer(data, options),
             b'$' => parse_bulk_string(data, options),
             b'*' => parse_array(data, options, depth, total_items),
             // RESP3 types
@@ -641,9 +663,9 @@ impl Value {
             #[cfg(feature = "resp3")]
             b'#' => parse_boolean(data),
             #[cfg(feature = "resp3")]
-            b',' => parse_double(data),
+            b',' => parse_double(data, options),
             #[cfg(feature = "resp3")]
-            b'(' => parse_big_number(data),
+            b'(' => parse_big_number(data, options),
             #[cfg(feature = "resp3")]
             b'!' => parse_bulk_error(data, options),
             #[cfg(feature = "resp3")]
@@ -791,38 +813,56 @@ impl Value {
 // Parsing helpers
 // ============================================================================
 
-/// Find the position of \r\n in the data.
+/// Find the position of the first `\r\n` in the data.
+///
+/// A bare `\r` not followed by `\n` is ordinary content, so the scan continues
+/// past it; only a real CRLF terminates a line. RESP simple strings and errors
+/// carry server text that can echo binary-safe key names, so a stray `\r` is
+/// reachable in practice.
 #[inline]
-pub(crate) fn find_crlf(data: &[u8]) -> Option<usize> {
-    classify_first_cr(data, memchr::memchr(b'\r', data))
+fn find_crlf(data: &[u8], max_line_len: usize) -> Result<Option<usize>, ParseError> {
+    let mut offset = 0;
+    while let Some(relative) = memchr::memchr(b'\r', &data[offset..]) {
+        let first_cr = offset + relative;
+        if let Some(pos) = classify_first_cr(data, Some(first_cr)) {
+            return Ok(Some(pos));
+        }
+        offset = first_cr + 1;
+    }
+
+    // No CRLF yet. Bound how long a caller can be asked to keep buffering.
+    if data.len() > max_line_len {
+        return Err(ParseError::Protocol("line too long".to_string()));
+    }
+
+    Ok(None)
 }
 
-/// Accept the first carriage return only when it begins a complete CRLF.
+/// Accept a candidate carriage return only when it begins a complete CRLF.
 ///
-/// RESP line payloads cannot contain carriage returns or line feeds, so a
-/// carriage return not immediately followed by a line feed leaves the frame
-/// incomplete rather than scanning past malformed payload data.
+/// The production scanner calls this seam for each carriage return until it
+/// finds the first complete CRLF.
 pub(crate) fn classify_first_cr(data: &[u8], first_cr: Option<usize>) -> Option<usize> {
     first_cr.filter(|&pos| pos + 1 < data.len() && data[pos + 1] == b'\n')
 }
 
 /// Parse a simple string: +OK\r\n
-fn parse_simple_string(data: &[u8]) -> Result<(Value, usize), ParseError> {
-    let end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+fn parse_simple_string(data: &[u8], options: &ParseOptions) -> Result<(Value, usize), ParseError> {
+    let end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let content = Bytes::copy_from_slice(&data[1..end]);
     Ok((Value::SimpleString(content), end + 2))
 }
 
 /// Parse an error: -ERR message\r\n
-fn parse_error(data: &[u8]) -> Result<(Value, usize), ParseError> {
-    let end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+fn parse_error(data: &[u8], options: &ParseOptions) -> Result<(Value, usize), ParseError> {
+    let end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let content = Bytes::copy_from_slice(&data[1..end]);
     Ok((Value::Error(content), end + 2))
 }
 
 /// Parse an integer: :1000\r\n
-fn parse_integer(data: &[u8]) -> Result<(Value, usize), ParseError> {
-    let end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+fn parse_integer(data: &[u8], options: &ParseOptions) -> Result<(Value, usize), ParseError> {
+    let end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let s = std::str::from_utf8(&data[1..end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let value: i64 = s
@@ -833,7 +873,7 @@ fn parse_integer(data: &[u8]) -> Result<(Value, usize), ParseError> {
 
 /// Parse a bulk string: $6\r\nfoobar\r\n or $-1\r\n
 fn parse_bulk_string(data: &[u8], options: &ParseOptions) -> Result<(Value, usize), ParseError> {
-    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let len: i64 = len_str
@@ -882,7 +922,7 @@ fn parse_array(
         return Err(ParseError::NestingTooDeep(depth));
     }
 
-    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let len: i64 = len_str
@@ -928,15 +968,18 @@ fn parse_array(
 // ============================================================================
 
 /// Parse a simple string zero-copy: +OK\r\n
-fn parse_simple_string_bytes(data: &Bytes) -> Result<(Value, usize), ParseError> {
-    let end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+fn parse_simple_string_bytes(
+    data: &Bytes,
+    options: &ParseOptions,
+) -> Result<(Value, usize), ParseError> {
+    let end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let content = data.slice(1..end);
     Ok((Value::SimpleString(content), end + 2))
 }
 
 /// Parse an error zero-copy: -ERR message\r\n
-fn parse_error_bytes(data: &Bytes) -> Result<(Value, usize), ParseError> {
-    let end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+fn parse_error_bytes(data: &Bytes, options: &ParseOptions) -> Result<(Value, usize), ParseError> {
+    let end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let content = data.slice(1..end);
     Ok((Value::Error(content), end + 2))
 }
@@ -946,7 +989,7 @@ fn parse_bulk_string_bytes(
     data: &Bytes,
     options: &ParseOptions,
 ) -> Result<(Value, usize), ParseError> {
-    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let len: i64 = len_str
@@ -993,7 +1036,7 @@ fn parse_array_bytes(
         return Err(ParseError::NestingTooDeep(depth));
     }
 
-    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let len: i64 = len_str
@@ -1034,8 +1077,11 @@ fn parse_array_bytes(
 
 /// Parse RESP3 big number zero-copy: (12345678901234567890\r\n
 #[cfg(feature = "resp3")]
-fn parse_big_number_bytes(data: &Bytes) -> Result<(Value, usize), ParseError> {
-    let end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+fn parse_big_number_bytes(
+    data: &Bytes,
+    options: &ParseOptions,
+) -> Result<(Value, usize), ParseError> {
+    let end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let content = data.slice(1..end);
     Ok((Value::BigNumber(content), end + 2))
 }
@@ -1046,7 +1092,7 @@ fn parse_bulk_error_bytes(
     data: &Bytes,
     options: &ParseOptions,
 ) -> Result<(Value, usize), ParseError> {
-    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let len: usize = len_str
@@ -1083,7 +1129,7 @@ fn parse_verbatim_string_bytes(
     data: &Bytes,
     options: &ParseOptions,
 ) -> Result<(Value, usize), ParseError> {
-    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let len: usize = len_str
@@ -1142,7 +1188,7 @@ fn parse_map_bytes(
         return Err(ParseError::NestingTooDeep(depth));
     }
 
-    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let len: usize = len_str
@@ -1201,7 +1247,7 @@ fn parse_set_bytes(
         return Err(ParseError::NestingTooDeep(depth));
     }
 
-    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let len: usize = len_str
@@ -1247,7 +1293,7 @@ fn parse_push_bytes(
         return Err(ParseError::NestingTooDeep(depth));
     }
 
-    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let len: usize = len_str
@@ -1293,7 +1339,7 @@ fn parse_attribute_bytes(
         return Err(ParseError::NestingTooDeep(depth));
     }
 
-    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let len: usize = len_str
@@ -1453,8 +1499,8 @@ fn parse_boolean(data: &[u8]) -> Result<(Value, usize), ParseError> {
 
 /// Parse RESP3 double: ,3.14159\r\n
 #[cfg(feature = "resp3")]
-fn parse_double(data: &[u8]) -> Result<(Value, usize), ParseError> {
-    let end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+fn parse_double(data: &[u8], options: &ParseOptions) -> Result<(Value, usize), ParseError> {
+    let end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let s =
         std::str::from_utf8(&data[1..end]).map_err(|e| ParseError::InvalidDouble(e.to_string()))?;
 
@@ -1472,8 +1518,8 @@ fn parse_double(data: &[u8]) -> Result<(Value, usize), ParseError> {
 
 /// Parse RESP3 big number: (12345678901234567890\r\n
 #[cfg(feature = "resp3")]
-fn parse_big_number(data: &[u8]) -> Result<(Value, usize), ParseError> {
-    let end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+fn parse_big_number(data: &[u8], options: &ParseOptions) -> Result<(Value, usize), ParseError> {
+    let end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let content = Bytes::copy_from_slice(&data[1..end]);
     Ok((Value::BigNumber(content), end + 2))
 }
@@ -1481,7 +1527,7 @@ fn parse_big_number(data: &[u8]) -> Result<(Value, usize), ParseError> {
 /// Parse RESP3 bulk error: !<len>\r\n<error>\r\n
 #[cfg(feature = "resp3")]
 fn parse_bulk_error(data: &[u8], options: &ParseOptions) -> Result<(Value, usize), ParseError> {
-    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let len: usize = len_str
@@ -1518,7 +1564,7 @@ fn parse_verbatim_string(
     data: &[u8],
     options: &ParseOptions,
 ) -> Result<(Value, usize), ParseError> {
-    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let len: usize = len_str
@@ -1578,7 +1624,7 @@ fn parse_map(
         return Err(ParseError::NestingTooDeep(depth));
     }
 
-    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let len: usize = len_str
@@ -1636,7 +1682,7 @@ fn parse_set(
         return Err(ParseError::NestingTooDeep(depth));
     }
 
-    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let len: usize = len_str
@@ -1683,7 +1729,7 @@ fn parse_push(
         return Err(ParseError::NestingTooDeep(depth));
     }
 
-    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let len: usize = len_str
@@ -1730,7 +1776,7 @@ fn parse_attribute(
         return Err(ParseError::NestingTooDeep(depth));
     }
 
-    let len_end = find_crlf(data).ok_or(ParseError::Incomplete)?;
+    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
     let len_str = std::str::from_utf8(&data[1..len_end])
         .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
     let len: usize = len_str
@@ -1988,6 +2034,65 @@ impl Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_crlf_skips_bare_cr() {
+        // A bare \r is content, not a terminator: keep scanning.
+        const MAX: usize = DEFAULT_MAX_LINE_LEN;
+        assert_eq!(find_crlf(b"a\rb\r\n", MAX), Ok(Some(3)));
+        assert_eq!(find_crlf(b"\r\n", MAX), Ok(Some(0)));
+        assert_eq!(find_crlf(b"\r\r\n", MAX), Ok(Some(1)));
+        assert_eq!(find_crlf(b"a\rb", MAX), Ok(None));
+        assert_eq!(find_crlf(b"", MAX), Ok(None));
+        // Past the bound with no CRLF, stop asking for more.
+        assert!(matches!(
+            find_crlf(b"aaaaaaaa", 4),
+            Err(ParseError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn unterminated_line_is_bounded() {
+        // Without a bound this reported Incomplete forever, so a peer that
+        // never sends a newline could make a caller buffer without limit.
+        let flood = [b'+'; DEFAULT_MAX_LINE_LEN + 1];
+        assert!(matches!(
+            Value::parse(&flood),
+            Err(ParseError::Protocol(ref m)) if m == "line too long"
+        ));
+
+        // At the bound it is still just "need more data".
+        let ok = [b'+'; DEFAULT_MAX_LINE_LEN];
+        assert!(matches!(Value::parse(&ok), Err(ParseError::Incomplete)));
+
+        // Bulk payload is bounded separately and must not be affected: a bulk
+        // string far larger than the line bound still parses.
+        let big = vec![b'v'; DEFAULT_MAX_LINE_LEN * 4];
+        let mut data = format!("${}\r\n", big.len()).into_bytes();
+        data.extend_from_slice(&big);
+        data.extend_from_slice(b"\r\n");
+        let options = ParseOptions::new().max_bulk_string_len(big.len());
+        let (value, consumed) =
+            Value::parse_with_options(&data, &options).expect("large bulk string must parse");
+        assert_eq!(consumed, data.len());
+        assert!(matches!(value, Value::BulkString(ref b) if b.len() == big.len()));
+    }
+
+    #[test]
+    fn bare_cr_in_simple_string_or_error_does_not_stall() {
+        // Redis keys are binary-safe and error replies echo user arguments, so
+        // a stray \r in server text is reachable. The line is complete; the
+        // parser must not report Incomplete and ask for bytes that cannot help.
+        let data = b"-ERR no such key 'a\rb'\r\n";
+        let (value, consumed) = Value::parse(data).expect("complete line must parse");
+        assert_eq!(consumed, data.len());
+        assert!(matches!(value, Value::Error(ref e) if e.as_ref() == b"ERR no such key 'a\rb'"));
+
+        let data = b"+OK a\rb\r\n";
+        let (value, consumed) = Value::parse(data).expect("complete line must parse");
+        assert_eq!(consumed, data.len());
+        assert!(matches!(value, Value::SimpleString(ref v) if v.as_ref() == b"OK a\rb"));
+    }
 
     #[test]
     fn test_parse_simple_string() {

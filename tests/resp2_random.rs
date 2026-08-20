@@ -53,12 +53,12 @@ fn input_for(iteration: usize, state: &mut u64) -> (Vec<u8>, bool) {
 }
 
 #[test]
-fn first_cr_not_followed_by_lf_is_incomplete() {
-    assert!(Value::parse(b"+bad\rX\r\n").unwrap_err().is_incomplete());
-    assert!(
-        Value::parse_bytes(Bytes::from_static(b"+bad\rX\r\n"))
-            .unwrap_err()
-            .is_incomplete()
+fn bare_cr_before_crlf_is_line_content() {
+    let expected = Value::simple_string(b"bad\rX");
+    assert_eq!(Value::parse(b"+bad\rX\r\n").unwrap(), (expected.clone(), 8));
+    assert_eq!(
+        Value::parse_bytes(Bytes::from_static(b"+bad\rX\r\n")).unwrap(),
+        (expected, 8)
     );
 }
 

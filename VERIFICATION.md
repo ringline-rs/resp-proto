@@ -4,7 +4,7 @@ This crate uses Kani for one bounded, production-used RESP2 framing decision and
 
 ## Formal proof boundary
 
-`classify_first_cr` decides whether the first carriage return found by the production `memchr` path begins a complete CRLF. RESP line payloads cannot contain CR or LF, so `\rX\r\n` is treated as incomplete at the first CR rather than scanning onward through malformed line data. The same function is compiled in normal and Kani builds; there is no alternate proof-only implementation.
+`classify_first_cr` decides whether a carriage return found by the production `memchr` path begins a complete CRLF. The production scanner applies it to successive candidates, so a bare `\r` is line content and scanning continues to the first real CRLF. The same function is compiled in normal and Kani builds; there is no alternate proof-only implementation.
 
 The proof checks every byte string of length 0 through 8 and every admissible candidate: `None`, or an in-bounds position containing CR. This is 19,097,521,942,299,935,490 constrained input/candidate combinations. It proves that a returned index is the supplied in-bounds CR immediately followed by LF, and that every rejected candidate is absent, truncated, or not followed by LF.
 
