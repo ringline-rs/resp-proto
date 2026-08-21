@@ -19,3 +19,6 @@ memchr = "2"
 itoa = "1"
 ryu = { version = "1", optional = true }
 thiserror = "2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

@@ -821,8 +821,13 @@ impl Value {
 /// reachable in practice.
 #[inline]
 fn find_crlf(data: &[u8], max_line_len: usize) -> Result<Option<usize>, ParseError> {
-    if let Some(pos) = memchr::memmem::find(data, b"\r\n") {
-        return Ok(Some(pos));
+    let mut offset = 0;
+    while let Some(relative) = memchr::memchr(b'\r', &data[offset..]) {
+        let first_cr = offset + relative;
+        if let Some(pos) = classify_first_cr(data, Some(first_cr)) {
+            return Ok(Some(pos));
+        }
+        offset = first_cr + 1;
     }
 
     // No CRLF yet. Bound how long a caller can be asked to keep buffering.
@@ -831,6 +836,14 @@ fn find_crlf(data: &[u8], max_line_len: usize) -> Result<Option<usize>, ParseErr
     }
 
     Ok(None)
+}
+
+/// Accept a candidate carriage return only when it begins a complete CRLF.
+///
+/// The production scanner calls this seam for each carriage return until it
+/// finds the first complete CRLF.
+pub(crate) fn classify_first_cr(data: &[u8], first_cr: Option<usize>) -> Option<usize> {
+    first_cr.filter(|&pos| pos + 1 < data.len() && data[pos + 1] == b'\n')
 }
 
 /// Parse a simple string: +OK\r\n
